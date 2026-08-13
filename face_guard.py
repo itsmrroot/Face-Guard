@@ -49,6 +49,7 @@ def _cascade_path(filename):
 FACE_CASCADE_PATH = _cascade_path("haarcascade_frontalface_default.xml")
 PROFILE_CASCADE_PATH = _cascade_path("haarcascade_profileface.xml")
 UPPERBODY_CASCADE_PATH = _cascade_path("haarcascade_upperbody.xml")
+STRANGER_SOUND_PATH = os.path.join(BASE_DIR, "assets", "sounds", "stranger_alert.mp3")
 
 # Recognition tuning
 CONFIDENCE_THRESHOLD = 65      # LBPH: LOWER distance = better match. Below this = "you".
@@ -94,6 +95,31 @@ def log(msg):
     print(line)
     with open(LOG_PATH, "a") as f:
         f.write(line + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Sound alerts (cross platform, non-blocking)
+# ---------------------------------------------------------------------------
+def play_sound(path):
+    if not os.path.exists(path):
+        return
+    system = platform.system()
+    try:
+        if system == "Darwin":
+            subprocess.Popen(["afplay", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif system == "Linux":
+            for cmd in (["mpg123", "-q", path],
+                        ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path],
+                        ["paplay", path]):
+                try:
+                    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    break
+                except FileNotFoundError:
+                    continue
+        elif system == "Windows":
+            os.startfile(path)  # noqa: uses the OS's default associated player, non-blocking
+    except Exception as e:
+        log(f"WARNING: could not play sound '{path}': {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +417,7 @@ def run(owner_name=None):
                 if now - last_lock_time > LOCK_COOLDOWN_SECONDS:
                     if stranger_streak >= CONSEC_STRANGER_FRAMES:
                         reason = "Unrecognized face"
+                        play_sound(STRANGER_SOUND_PATH)
                     elif camera_covered_streak >= CAMERA_COVERED_LOCK_FRAMES:
                         reason = "Camera appears physically covered/blocked"
                     elif person_no_face_streak >= PERSON_NO_FACE_LOCK_FRAMES:
