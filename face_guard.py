@@ -49,6 +49,7 @@ def _cascade_path(filename):
 FACE_CASCADE_PATH = _cascade_path("haarcascade_frontalface_default.xml")
 PROFILE_CASCADE_PATH = _cascade_path("haarcascade_profileface.xml")
 UPPERBODY_CASCADE_PATH = _cascade_path("haarcascade_upperbody.xml")
+EYE_CASCADE_PATH = _cascade_path("haarcascade_eye.xml")
 
 # Recognition tuning
 CONFIDENCE_THRESHOLD = 65      # LBPH: LOWER distance = better match. Below this = "you".
@@ -97,6 +98,37 @@ def load_cascade(path):
             f"and save it to '{os.path.join(_CASCADE_DIR, filename)}'."
         )
     return cascade
+
+
+_clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+
+def preprocess_face(gray_frame, box, eye_cascade=None):
+    """Crops a face region and normalizes it for LBPH: eye-based rotation alignment (when two
+    eyes can be found), resize to a fixed size, then CLAHE for lighting-robust contrast. Used
+    identically at both enrollment and recognition time, since LBPH needs consistent preprocessing
+    on both sides to compare fairly."""
+    x, y, w, h = box
+    face = gray_frame[y:y + h, x:x + w]
+    if face.size == 0:
+        return None
+
+    if eye_cascade is not None:
+        eyes = eye_cascade.detectMultiScale(face, scaleFactor=1.1, minNeighbors=5, minSize=(15, 15))
+        if len(eyes) >= 2:
+            # Use the two largest detections (most likely the real eyes, not eyebrows/glasses
+            # glare), ordered left-to-right, and rotate so the line between them is level.
+            eyes = sorted(eyes, key=lambda e: e[2] * e[3], reverse=True)[:2]
+            (ex1, ey1, ew1, eh1), (ex2, ey2, ew2, eh2) = sorted(eyes, key=lambda e: e[0])
+            c1 = (ex1 + ew1 / 2, ey1 + eh1 / 2)
+            c2 = (ex2 + ew2 / 2, ey2 + eh2 / 2)
+            angle = np.degrees(np.arctan2(c2[1] - c1[1], c2[0] - c1[0]))
+            center = (face.shape[1] / 2, face.shape[0] / 2)
+            rot_mat = cv2.getRotationMatrix2D(center, angle, 1.0)
+            face = cv2.warpAffine(face, rot_mat, (face.shape[1], face.shape[0]))
+
+    face = cv2.resize(face, (200, 200))
+    return _clahe.apply(face)
 
 
 def log(msg):
@@ -170,6 +202,7 @@ def lock_screen():
 # ---------------------------------------------------------------------------
 def enroll(name, num_samples=40):
     face_cascade = load_cascade(FACE_CASCADE_PATH)
+    eye_cascade = load_cascade(EYE_CASCADE_PATH)
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         log("ERROR: could not open webcam.")
@@ -178,14 +211,22 @@ def enroll(name, num_samples=40):
     person_dir = os.path.join(DATASET_DIR, name)
     os.makedirs(person_dir, exist_ok=True)
 
-    count = 0
+    # Continue numbering from whatever's already there instead of overwriting it -- this lets you
+    # run enroll again on a different day/lighting/angle to build a richer, more varied dataset
+    # instead of each session destroying the last one.
+    existing_indices = [
+        int(os.path.splitext(f)[0]) for f in os.listdir(person_dir)
+        if os.path.splitext(f)[0].isdigit() and f.lower().endswith(".jpg")
+    ]
+    count = max(existing_indices) if existing_indices else 0
+    target = count + num_samples
     last_capture_time = 0.0
     prompts = ["look straight ahead", "turn slightly left", "turn slightly right",
                "tilt your head up a bit", "tilt your head down a bit", "normal / relaxed"]
-    print(f"Look at the camera. Capturing {num_samples} samples for '{name}' -- "
+    print(f"Look at the camera. Capturing {num_samples} more samples for '{name}' -- "
           f"move your head slowly through different angles as it captures. Press 'q' to stop early.")
 
-    while count < num_samples:
+    while count < target:
         ret, frame = cap.read()
         if not ret:
             continue
@@ -201,13 +242,13 @@ def enroll(name, num_samples=40):
             cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
 
             if can_capture:
-                face_img = cv2.equalizeHist(gray[y:y + h, x:x + w])
-                face_img = cv2.resize(face_img, (200, 200))
-                count += 1
-                last_capture_time = now
-                cv2.imwrite(os.path.join(person_dir, f"{count}.jpg"), face_img)
-                cv2.putText(frame, f"{count}/{num_samples}", (x, y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+                face_img = preprocess_face(gray, (x, y, w, h), eye_cascade)
+                if face_img is not None:
+                    count += 1
+                    last_capture_time = now
+                    cv2.imwrite(os.path.join(person_dir, f"{count}.jpg"), face_img)
+                    cv2.putText(frame, f"{count}/{target}", (x, y - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
             break  # one face per frame is enough
 
         prompt = prompts[count % len(prompts)]
@@ -220,7 +261,7 @@ def enroll(name, num_samples=40):
 
     cap.release()
     cv2.destroyAllWindows()
-    log(f"Enrolled {count} samples for '{name}' in {person_dir}")
+    log(f"'{name}' now has {count} enrolled samples total in {person_dir}")
 
 
 # ---------------------------------------------------------------------------
@@ -263,10 +304,27 @@ def train():
     recognizer.train(images, np.array(labels))
     recognizer.save(MODEL_PATH)
 
-    with open(LABELS_PATH, "wb") as f:
-        pickle.dump(label_map, f)
+    # Calibrate the match threshold from the data itself instead of relying purely on the fixed
+    # CONFIDENCE_THRESHOLD constant: re-predict every training image (LBPH: lower = better match)
+    # and set the cutoff a bit above the worst self-match, so it's tailored to how distinguishable
+    # this particular dataset actually is instead of a one-size-fits-all guess.
+    self_confidences = []
+    for img, true_label in zip(images, labels):
+        predicted_label, confidence = recognizer.predict(img)
+        if predicted_label == true_label:
+            self_confidences.append(confidence)
 
-    log(f"Trained on {len(images)} images across {len(people)} people: {list(label_map.values())}")
+    if self_confidences:
+        calibrated_threshold = float(np.mean(self_confidences) + 2 * np.std(self_confidences))
+        calibrated_threshold = max(40.0, min(calibrated_threshold, 100.0))
+    else:
+        calibrated_threshold = CONFIDENCE_THRESHOLD
+
+    with open(LABELS_PATH, "wb") as f:
+        pickle.dump({"label_map": label_map, "confidence_threshold": calibrated_threshold}, f)
+
+    log(f"Trained on {len(images)} images across {len(people)} people: {list(label_map.values())} "
+        f"(calibrated confidence threshold: {calibrated_threshold:.1f})")
 
 
 # ---------------------------------------------------------------------------
@@ -280,11 +338,19 @@ def run(owner_name=None):
     face_cascade = load_cascade(FACE_CASCADE_PATH)
     profile_cascade = load_cascade(PROFILE_CASCADE_PATH)
     upperbody_cascade = load_cascade(UPPERBODY_CASCADE_PATH)
+    eye_cascade = load_cascade(EYE_CASCADE_PATH)
     recognizer = cv2.face.LBPHFaceRecognizer_create()
     recognizer.read(MODEL_PATH)
 
     with open(LABELS_PATH, "rb") as f:
-        label_map = pickle.load(f)
+        saved = pickle.load(f)
+    if isinstance(saved, dict) and "label_map" in saved:
+        label_map = saved["label_map"]
+        confidence_threshold = saved.get("confidence_threshold", CONFIDENCE_THRESHOLD)
+    else:
+        label_map = saved  # labels.pickle from before threshold calibration existed
+        confidence_threshold = CONFIDENCE_THRESHOLD
+    log(f"Using confidence threshold: {confidence_threshold:.1f}")
 
     # figure out which label id is "the owner"
     if owner_name:
@@ -345,11 +411,12 @@ def run(owner_name=None):
                 detections = []  # (box, color, label) for every face/body found this check
 
                 for (x, y, w, h) in faces:
-                    face_img = cv2.equalizeHist(gray[y:y + h, x:x + w])
-                    face_img = cv2.resize(face_img, (200, 200))
+                    face_img = preprocess_face(gray, (x, y, w, h), eye_cascade)
+                    if face_img is None:
+                        continue
                     label_id, confidence = recognizer.predict(face_img)
                     # LBPH: LOWER confidence value = better match
-                    is_owner = (label_id == owner_id) and (confidence < CONFIDENCE_THRESHOLD)
+                    is_owner = (label_id == owner_id) and (confidence < confidence_threshold)
 
                     if not is_owner:
                         frame_is_stranger = True
