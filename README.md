@@ -90,6 +90,14 @@ state and every streak counter, e.g.
 `[PERSON, NO FACE] face=False side=False person=True covered=False stranger=0/8 person_no_face=3/5 camera_covered=0/2 no_face=3/50`
 — use it to see exactly what the guard is seeing while you test.
 
+The box doesn't just appear on the exact frames a cascade fires — a CSRT
+object tracker keeps it gliding smoothly across the primary detected
+face/body in between, redrawing the preview roughly every
+`DISPLAY_REFRESH_MS` (default 50ms) instead of only once per
+`CHECK_INTERVAL`. The full detection/recognition/lock-decision logic still
+only runs once per `CHECK_INTERVAL`, so this only changes how smooth the
+preview *looks* — it doesn't change lock timing.
+
 Each check runs a small pipeline:
 
 0. **Covered-lens check** — the frame's pixel variance (`np.std`) is
@@ -146,7 +154,8 @@ Open `face_guard.py` and adjust the constants near the top if needed:
 | `LOCK_ON_NO_FACE` | Default `False`. Set `True` to *also* lock when literally nothing (no face, no person, no covered-lens signal) is detected for too long (see `NO_FACE_LOCK_FRAMES`) — catches edge cases the two checks above miss, but **also locks when you simply walk away**, since an empty frame looks the same either way. |
 | `NO_FACE_LOCK_FRAMES` | (only matters if `LOCK_ON_NO_FACE = True`) checks in a row with nothing detected at all before locking anyway. Default `50` (~15s). |
 | `LOCK_COOLDOWN_SECONDS` | Minimum time between lock triggers. |
-| `CHECK_INTERVAL` | Seconds between webcam checks. Lower = more CPU use, faster reaction. |
+| `CHECK_INTERVAL` | Seconds between full detection/recognition/lock-decision checks. Lower = more CPU use, faster reaction. |
+| `DISPLAY_REFRESH_MS` | Milliseconds between preview-window redraws (the CSRT tracker updates the box on each one). Default `50`. Lower = smoother-looking tracking, more CPU use; doesn't affect lock timing. |
 
 ## 🔁 Run it automatically at startup
 
@@ -251,6 +260,12 @@ it used (`Screen locked via 'open'` / `'osascript'` / `'pmset'`):
   similar-looking people, etc. can occasionally fool it. Don't treat this as
   your *only* line of defense; keep a strong OS password/PIN as the real
   security boundary.
+- The CSRT tracker that glides the preview box between checks only follows
+  one region at a time (the primary detected face/body) — with multiple
+  people in frame, only the first one gets a smoothly-tracked box. It's
+  also more CPU-hungry than the cascades; if the preview feels sluggish,
+  raise `DISPLAY_REFRESH_MS` or swap `cv2.TrackerCSRT_create()` for the
+  faster (less accurate) `cv2.TrackerKCF_create()` in `run()`.
 - The upper-body detector (used for the "person present, face hidden" lock)
   is a coarser, less reliable Haar cascade than the face ones — it may miss
   a person depending on distance/framing, or occasionally false-trigger on

@@ -70,7 +70,11 @@ CAMERA_COVERED_STD_THRESHOLD = 12   # grayscale std-dev below this means the len
 CAMERA_COVERED_LOCK_FRAMES = 2      # consecutive covered checks before locking -- near-instant, since
                                      # this signal is unambiguous and can't mean "owner just walked away"
 LOCK_COOLDOWN_SECONDS = 30     # don't re-trigger a lock spam within this window
-CHECK_INTERVAL = 0.3           # seconds between webcam checks (lower = more responsive, more CPU)
+CHECK_INTERVAL = 0.3           # seconds between full detection/recognition checks (lower = more
+                                # responsive, more CPU)
+DISPLAY_REFRESH_MS = 50        # how often the preview window redraws between checks -- a CSRT tracker
+                                # glides the box smoothly across these frames so it visibly follows
+                                # the face/body instead of only updating once per CHECK_INTERVAL
 
 os.makedirs(DATASET_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
@@ -322,157 +326,202 @@ def run(owner_name=None):
     last_lock_time = 0
     sound_process = None
 
+    # A tracker keeps a box smoothly gliding across the primary detected face/body between the
+    # (slower) full detection+recognition checks below, instead of a box that only appears on the
+    # exact frames a cascade happens to fire on.
+    tracker = None
+    tracker_color = (0, 255, 0)
+    tracker_label = ""
+    debug_line = ""
+    camera_covered = False
+    last_check_time = 0.0
+
     try:
         while True:
             ret, frame = cap.read()
             if not ret:
-                cv2.waitKey(int(CHECK_INTERVAL * 1000))
+                cv2.waitKey(DISPLAY_REFRESH_MS)
                 continue
 
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            now = time.time()
+            if now - last_check_time >= CHECK_INTERVAL:
+                last_check_time = now
 
-            # A physically covered/blocked lens produces a near-featureless image (very low
-            # pixel variance) -- unlike an empty room, which still has plenty of visual texture.
-            camera_covered = float(np.std(gray)) < CAMERA_COVERED_STD_THRESHOLD
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-            faces = [] if camera_covered else list(face_cascade.detectMultiScale(
-                gray, scaleFactor=1.2, minNeighbors=5, minSize=(80, 80)))
+                # A physically covered/blocked lens produces a near-featureless image (very low
+                # pixel variance) -- unlike an empty room, which still has plenty of visual texture.
+                camera_covered = float(np.std(gray)) < CAMERA_COVERED_STD_THRESHOLD
 
-            frame_is_stranger = False
-            frame_has_face = len(faces) > 0
-
-            for (x, y, w, h) in faces:
-                face_img = cv2.resize(gray[y:y + h, x:x + w], (200, 200))
-                label_id, confidence = recognizer.predict(face_img)
-                # LBPH: LOWER confidence value = better match
-                is_owner = (label_id == owner_id) and (confidence < CONFIDENCE_THRESHOLD)
-
-                if is_owner:
-                    stop_sound(sound_process)
-                    sound_process = None
-                else:
-                    frame_is_stranger = True
-                    now_dt = datetime.now()
-                    day_dir = os.path.join(SNAPSHOT_DIR, now_dt.strftime("%Y-%m-%d"))
-                    os.makedirs(day_dir, exist_ok=True)
-                    snap_path = os.path.join(day_dir, f"stranger_{now_dt.strftime('%H-%M-%S')}.jpg")
-                    cv2.imwrite(snap_path, frame)
-
-                color = (0, 255, 0) if is_owner else (0, 0, 255)
-                label = owner_name if is_owner else "STRANGER"
-                cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-                cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-
-            # No frontal face -> check for a face turned to the side before giving up on
-            # "is there a face at all" (avoids false stranger/person-hiding flags on a head turn).
-            profile_detected = False
-            if not frame_has_face and not camera_covered:
-                profile_faces = list(profile_cascade.detectMultiScale(
+                faces = [] if camera_covered else list(face_cascade.detectMultiScale(
                     gray, scaleFactor=1.2, minNeighbors=5, minSize=(80, 80)))
-                if not profile_faces:
-                    # the profile cascade only looks one way -- flip the frame to catch the other side
-                    flipped = cv2.flip(gray, 1)
-                    frame_width = gray.shape[1]
-                    for (fx, fy, fw, fh) in profile_cascade.detectMultiScale(
-                            flipped, scaleFactor=1.2, minNeighbors=5, minSize=(80, 80)):
-                        profile_faces.append((frame_width - fx - fw, fy, fw, fh))
-                profile_detected = len(profile_faces) > 0
-                for (x, y, w, h) in profile_faces:
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 255), 2)
-                    cv2.putText(frame, "FACE (side)", (x, y - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-            frame_has_any_face = frame_has_face or profile_detected
+                frame_is_stranger = False
+                frame_has_face = len(faces) > 0
+                primary_box, primary_color, primary_label = None, tracker_color, tracker_label
 
-            # No face at all (front or side) -> check whether a PERSON is still there.
-            # This is what tells "owner walked away" (nothing detected) apart from
-            # "someone's sitting right there with their face hidden/covered/turned away".
-            person_detected = False
-            if not frame_has_any_face and not camera_covered:
-                bodies = upperbody_cascade.detectMultiScale(
-                    gray, scaleFactor=1.1, minNeighbors=3, minSize=(80, 80))
-                person_detected = len(bodies) > 0
-                for (x, y, w, h) in bodies:
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 140, 255), 2)
-                    cv2.putText(frame, "PERSON (no face)", (x, y - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 140, 255), 2)
+                for idx, (x, y, w, h) in enumerate(faces):
+                    face_img = cv2.resize(gray[y:y + h, x:x + w], (200, 200))
+                    label_id, confidence = recognizer.predict(face_img)
+                    # LBPH: LOWER confidence value = better match
+                    is_owner = (label_id == owner_id) and (confidence < CONFIDENCE_THRESHOLD)
 
-            camera_covered_streak = camera_covered_streak + 1 if camera_covered else 0
-
-            if frame_is_stranger:
-                stranger_streak += 1
-                no_face_streak = 0
-                person_no_face_streak = 0
-            elif frame_has_any_face:
-                stranger_streak = 0  # owner's face confirmed, reset
-                no_face_streak = 0
-                person_no_face_streak = 0
-            else:
-                no_face_streak += 1
-                person_no_face_streak = person_no_face_streak + 1 if person_detected else 0
-                if not CONSEC_NO_FACE_OK:
-                    stranger_streak += 1
-                # else: empty desk (briefly) doesn't count against the short-term streak -- but a
-                # PERSON detected with no face trips person_no_face_streak fast (someone hiding),
-                # a covered lens trips camera_covered_streak almost instantly, and a prolonged
-                # total absence of anything still trips no_face_streak eventually if LOCK_ON_NO_FACE
-                # is on
-
-            should_lock = (
-                stranger_streak >= CONSEC_STRANGER_FRAMES
-                or person_no_face_streak >= PERSON_NO_FACE_LOCK_FRAMES
-                or camera_covered_streak >= CAMERA_COVERED_LOCK_FRAMES
-            )
-            if LOCK_ON_NO_FACE:
-                should_lock = should_lock or no_face_streak >= NO_FACE_LOCK_FRAMES
-            if should_lock:
-                now = time.time()
-                if now - last_lock_time > LOCK_COOLDOWN_SECONDS:
-                    if stranger_streak >= CONSEC_STRANGER_FRAMES:
-                        reason = "Unrecognized face"
+                    if is_owner:
                         stop_sound(sound_process)
-                        sound_process = play_sound(STRANGER_SOUND_PATH)
-                    elif camera_covered_streak >= CAMERA_COVERED_LOCK_FRAMES:
-                        reason = "Camera appears physically covered/blocked"
-                    elif person_no_face_streak >= PERSON_NO_FACE_LOCK_FRAMES:
-                        reason = "Person present with no recognizable face (hiding?)"
+                        sound_process = None
                     else:
-                        reason = "No face visible for a long time"
-                    log(f"{reason} detected repeatedly -> locking screen.")
-                    lock_screen()
-                    last_lock_time = now
-                stranger_streak = 0
-                no_face_streak = 0
-                person_no_face_streak = 0
-                camera_covered_streak = 0
+                        frame_is_stranger = True
+                        now_dt = datetime.now()
+                        day_dir = os.path.join(SNAPSHOT_DIR, now_dt.strftime("%Y-%m-%d"))
+                        os.makedirs(day_dir, exist_ok=True)
+                        snap_path = os.path.join(day_dir, f"stranger_{now_dt.strftime('%H-%M-%S')}.jpg")
+                        cv2.imwrite(snap_path, frame)
 
-            if camera_covered:
-                status = "CAMERA COVERED"
-            elif frame_is_stranger:
-                status = "STRANGER"
-            elif frame_has_face:
-                status = "OWNER OK"
-            elif profile_detected:
-                status = "SIDE FACE"
-            elif person_detected:
-                status = "PERSON, NO FACE"
+                    color = (0, 255, 0) if is_owner else (0, 0, 255)
+                    label = owner_name if is_owner else "STRANGER"
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+                    cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+                    if idx == 0:
+                        primary_box, primary_color, primary_label = (x, y, w, h), color, label
+
+                # No frontal face -> check for a face turned to the side before giving up on
+                # "is there a face at all" (avoids false stranger/person-hiding flags on a head turn).
+                profile_detected = False
+                if not frame_has_face and not camera_covered:
+                    profile_faces = list(profile_cascade.detectMultiScale(
+                        gray, scaleFactor=1.2, minNeighbors=5, minSize=(80, 80)))
+                    if not profile_faces:
+                        # the profile cascade only looks one way -- flip the frame to catch the other side
+                        flipped = cv2.flip(gray, 1)
+                        frame_width = gray.shape[1]
+                        for (fx, fy, fw, fh) in profile_cascade.detectMultiScale(
+                                flipped, scaleFactor=1.2, minNeighbors=5, minSize=(80, 80)):
+                            profile_faces.append((frame_width - fx - fw, fy, fw, fh))
+                    profile_detected = len(profile_faces) > 0
+                    for idx, (x, y, w, h) in enumerate(profile_faces):
+                        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 255), 2)
+                        cv2.putText(frame, "FACE (side)", (x, y - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                        if idx == 0:
+                            primary_box = (x, y, w, h)
+                            primary_color, primary_label = (0, 255, 255), "FACE (side)"
+
+                frame_has_any_face = frame_has_face or profile_detected
+
+                # No face at all (front or side) -> check whether a PERSON is still there.
+                # This is what tells "owner walked away" (nothing detected) apart from
+                # "someone's sitting right there with their face hidden/covered/turned away".
+                person_detected = False
+                if not frame_has_any_face and not camera_covered:
+                    bodies = upperbody_cascade.detectMultiScale(
+                        gray, scaleFactor=1.1, minNeighbors=3, minSize=(80, 80))
+                    person_detected = len(bodies) > 0
+                    for idx, (x, y, w, h) in enumerate(bodies):
+                        cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 140, 255), 2)
+                        cv2.putText(frame, "PERSON (no face)", (x, y - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 140, 255), 2)
+                        if idx == 0:
+                            primary_box = (x, y, w, h)
+                            primary_color, primary_label = (0, 140, 255), "PERSON (no face)"
+
+                camera_covered_streak = camera_covered_streak + 1 if camera_covered else 0
+
+                if frame_is_stranger:
+                    stranger_streak += 1
+                    no_face_streak = 0
+                    person_no_face_streak = 0
+                elif frame_has_any_face:
+                    stranger_streak = 0  # owner's face confirmed, reset
+                    no_face_streak = 0
+                    person_no_face_streak = 0
+                else:
+                    no_face_streak += 1
+                    person_no_face_streak = person_no_face_streak + 1 if person_detected else 0
+                    if not CONSEC_NO_FACE_OK:
+                        stranger_streak += 1
+                    # else: empty desk (briefly) doesn't count against the short-term streak -- but a
+                    # PERSON detected with no face trips person_no_face_streak fast (someone hiding),
+                    # a covered lens trips camera_covered_streak almost instantly, and a prolonged
+                    # total absence of anything still trips no_face_streak eventually if
+                    # LOCK_ON_NO_FACE is on
+
+                should_lock = (
+                    stranger_streak >= CONSEC_STRANGER_FRAMES
+                    or person_no_face_streak >= PERSON_NO_FACE_LOCK_FRAMES
+                    or camera_covered_streak >= CAMERA_COVERED_LOCK_FRAMES
+                )
+                if LOCK_ON_NO_FACE:
+                    should_lock = should_lock or no_face_streak >= NO_FACE_LOCK_FRAMES
+                if should_lock:
+                    lock_now = time.time()
+                    if lock_now - last_lock_time > LOCK_COOLDOWN_SECONDS:
+                        if stranger_streak >= CONSEC_STRANGER_FRAMES:
+                            reason = "Unrecognized face"
+                            stop_sound(sound_process)
+                            sound_process = play_sound(STRANGER_SOUND_PATH)
+                        elif camera_covered_streak >= CAMERA_COVERED_LOCK_FRAMES:
+                            reason = "Camera appears physically covered/blocked"
+                        elif person_no_face_streak >= PERSON_NO_FACE_LOCK_FRAMES:
+                            reason = "Person present with no recognizable face (hiding?)"
+                        else:
+                            reason = "No face visible for a long time"
+                        log(f"{reason} detected repeatedly -> locking screen.")
+                        lock_screen()
+                        last_lock_time = lock_now
+                    stranger_streak = 0
+                    no_face_streak = 0
+                    person_no_face_streak = 0
+                    camera_covered_streak = 0
+
+                if camera_covered:
+                    status = "CAMERA COVERED"
+                elif frame_is_stranger:
+                    status = "STRANGER"
+                elif frame_has_face:
+                    status = "OWNER OK"
+                elif profile_detected:
+                    status = "SIDE FACE"
+                elif person_detected:
+                    status = "PERSON, NO FACE"
+                else:
+                    status = "NOTHING"
+                debug_line = (
+                    f"[{status}] face={frame_has_face} side={profile_detected} person={person_detected} "
+                    f"covered={camera_covered} stranger={stranger_streak}/{CONSEC_STRANGER_FRAMES} "
+                    f"person_no_face={person_no_face_streak}/{PERSON_NO_FACE_LOCK_FRAMES} "
+                    f"camera_covered={camera_covered_streak}/{CAMERA_COVERED_LOCK_FRAMES} "
+                    f"no_face={no_face_streak}/{NO_FACE_LOCK_FRAMES}"
+                )
+                print(debug_line)
+
+                # (Re)anchor the tracker on whatever we just found, so the box keeps gliding
+                # smoothly across the faster-refreshing frames until the next check.
+                if primary_box is not None:
+                    tracker = cv2.TrackerCSRT_create()
+                    tracker.init(frame, tuple(int(v) for v in primary_box))
+                    tracker_color, tracker_label = primary_color, primary_label
+                else:
+                    tracker = None
+
             else:
-                status = "NOTHING"
-            debug_line = (
-                f"[{status}] face={frame_has_face} side={profile_detected} person={person_detected} "
-                f"covered={camera_covered} stranger={stranger_streak}/{CONSEC_STRANGER_FRAMES} "
-                f"person_no_face={person_no_face_streak}/{PERSON_NO_FACE_LOCK_FRAMES} "
-                f"camera_covered={camera_covered_streak}/{CAMERA_COVERED_LOCK_FRAMES} "
-                f"no_face={no_face_streak}/{NO_FACE_LOCK_FRAMES}"
-            )
-            print(debug_line)
+                # Between checks: glide the box smoothly instead of leaving it frozen or vanished.
+                if tracker is not None:
+                    ok, box = tracker.update(frame)
+                    if ok:
+                        x, y, w, h = (int(v) for v in box)
+                        cv2.rectangle(frame, (x, y), (x + w, y + h), tracker_color, 2)
+                        cv2.putText(frame, tracker_label, (x, y - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, tracker_color, 2)
+                    else:
+                        tracker = None
+
             cv2.putText(frame, debug_line, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
             if camera_covered:
                 cv2.putText(frame, "CAMERA COVERED", (10, 60),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
             cv2.imshow("Face Guard - press q to quit", frame)
-            if cv2.waitKey(int(CHECK_INTERVAL * 1000)) & 0xFF == ord('q'):
+            if cv2.waitKey(DISPLAY_REFRESH_MS) & 0xFF == ord('q'):
                 break
 
     except KeyboardInterrupt:
