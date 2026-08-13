@@ -75,6 +75,8 @@ CHECK_INTERVAL = 0.3           # seconds between full detection/recognition chec
 DISPLAY_REFRESH_MS = 50        # how often the preview window redraws between checks -- a CSRT tracker
                                 # glides the box smoothly across these frames so it visibly follows
                                 # the face/body instead of only updating once per CHECK_INTERVAL
+MAX_TRACKED_OBJECTS = 5        # cap on how many faces/bodies get their own tracker at once -- each
+                                # CSRT tracker is fairly CPU-heavy, so this bounds worst-case load
 
 os.makedirs(DATASET_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
@@ -326,12 +328,11 @@ def run(owner_name=None):
     last_lock_time = 0
     sound_process = None
 
-    # A tracker keeps a box smoothly gliding across the primary detected face/body between the
-    # (slower) full detection+recognition checks below, instead of a box that only appears on the
-    # exact frames a cascade happens to fire on.
-    tracker = None
-    tracker_color = (0, 255, 0)
-    tracker_label = ""
+    # Trackers keep boxes smoothly gliding across every detected face/body between the (slower)
+    # full detection+recognition checks below, instead of boxes that only appear on the exact
+    # frames a cascade happens to fire on -- one tracker per detected object, so multiple people
+    # in frame each keep their own box instead of only the first one being followed.
+    trackers = []
     debug_line = ""
     camera_covered = False
     last_check_time = 0.0
@@ -358,9 +359,9 @@ def run(owner_name=None):
 
                 frame_is_stranger = False
                 frame_has_face = len(faces) > 0
-                primary_box, primary_color, primary_label = None, tracker_color, tracker_label
+                detections = []  # (box, color, label) for every face/body found this check
 
-                for idx, (x, y, w, h) in enumerate(faces):
+                for (x, y, w, h) in faces:
                     face_img = cv2.resize(gray[y:y + h, x:x + w], (200, 200))
                     label_id, confidence = recognizer.predict(face_img)
                     # LBPH: LOWER confidence value = better match
@@ -381,8 +382,7 @@ def run(owner_name=None):
                     label = owner_name if is_owner else "STRANGER"
                     cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
                     cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-                    if idx == 0:
-                        primary_box, primary_color, primary_label = (x, y, w, h), color, label
+                    detections.append(((x, y, w, h), color, label))
 
                 # No frontal face -> check for a face turned to the side before giving up on
                 # "is there a face at all" (avoids false stranger/person-hiding flags on a head turn).
@@ -398,13 +398,11 @@ def run(owner_name=None):
                                 flipped, scaleFactor=1.2, minNeighbors=5, minSize=(80, 80)):
                             profile_faces.append((frame_width - fx - fw, fy, fw, fh))
                     profile_detected = len(profile_faces) > 0
-                    for idx, (x, y, w, h) in enumerate(profile_faces):
+                    for (x, y, w, h) in profile_faces:
                         cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 255), 2)
                         cv2.putText(frame, "FACE (side)", (x, y - 10),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                        if idx == 0:
-                            primary_box = (x, y, w, h)
-                            primary_color, primary_label = (0, 255, 255), "FACE (side)"
+                        detections.append(((x, y, w, h), (0, 255, 255), "FACE (side)"))
 
                 frame_has_any_face = frame_has_face or profile_detected
 
@@ -416,13 +414,11 @@ def run(owner_name=None):
                     bodies = upperbody_cascade.detectMultiScale(
                         gray, scaleFactor=1.1, minNeighbors=3, minSize=(80, 80))
                     person_detected = len(bodies) > 0
-                    for idx, (x, y, w, h) in enumerate(bodies):
+                    for (x, y, w, h) in bodies:
                         cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 140, 255), 2)
                         cv2.putText(frame, "PERSON (no face)", (x, y - 10),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 140, 255), 2)
-                        if idx == 0:
-                            primary_box = (x, y, w, h)
-                            primary_color, primary_label = (0, 140, 255), "PERSON (no face)"
+                        detections.append(((x, y, w, h), (0, 140, 255), "PERSON (no face)"))
 
                 camera_covered_streak = camera_covered_streak + 1 if camera_covered else 0
 
@@ -494,26 +490,28 @@ def run(owner_name=None):
                 )
                 print(debug_line)
 
-                # (Re)anchor the tracker on whatever we just found, so the box keeps gliding
-                # smoothly across the faster-refreshing frames until the next check.
-                if primary_box is not None:
-                    tracker = cv2.TrackerCSRT_create()
-                    tracker.init(frame, tuple(int(v) for v in primary_box))
-                    tracker_color, tracker_label = primary_color, primary_label
-                else:
-                    tracker = None
+                # (Re)anchor a tracker on every detection we just found (up to the cap), so each
+                # one keeps gliding smoothly across the faster-refreshing frames until the next
+                # check -- not just the first face/body in the frame.
+                trackers = []
+                for box, color, label in detections[:MAX_TRACKED_OBJECTS]:
+                    t = cv2.TrackerCSRT_create()
+                    t.init(frame, tuple(int(v) for v in box))
+                    trackers.append({"tracker": t, "color": color, "label": label})
 
             else:
-                # Between checks: glide the box smoothly instead of leaving it frozen or vanished.
-                if tracker is not None:
-                    ok, box = tracker.update(frame)
+                # Between checks: glide every tracked box smoothly instead of leaving it frozen
+                # or vanished. Drop any tracker that loses its target until the next check.
+                still_tracking = []
+                for entry in trackers:
+                    ok, box = entry["tracker"].update(frame)
                     if ok:
                         x, y, w, h = (int(v) for v in box)
-                        cv2.rectangle(frame, (x, y), (x + w, y + h), tracker_color, 2)
-                        cv2.putText(frame, tracker_label, (x, y - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, tracker_color, 2)
-                    else:
-                        tracker = None
+                        cv2.rectangle(frame, (x, y), (x + w, y + h), entry["color"], 2)
+                        cv2.putText(frame, entry["label"], (x, y - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, entry["color"], 2)
+                        still_tracking.append(entry)
+                trackers = still_tracking
 
             cv2.putText(frame, debug_line, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
             if camera_covered:
