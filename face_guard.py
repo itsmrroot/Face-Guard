@@ -53,6 +53,10 @@ STRANGER_SOUND_PATH = os.path.join(BASE_DIR, "assets", "sounds", "stranger_alert
 
 # Recognition tuning
 CONFIDENCE_THRESHOLD = 65      # LBPH: LOWER distance = better match. Below this = "you".
+ENROLL_CAPTURE_INTERVAL = 0.35 # minimum seconds between saved enrollment photos -- without this,
+                                # a continuously-detected face gets all ~40 samples captured in about
+                                # a second, producing near-duplicate photos with zero real pose/
+                                # lighting variation, which is a common cause of poor recognition later
 CONSEC_STRANGER_FRAMES = 8     # how many bad (frontal-face) frames in a row before locking
 CONSEC_NO_FACE_OK = True       # if True, a brief empty frame (nobody there) does NOT count as a stranger
 PERSON_NO_FACE_LOCK_FRAMES = 5 # if a PERSON (upper body) is detected but NO face (front or side) for
@@ -210,7 +214,11 @@ def enroll(name, num_samples=40):
     os.makedirs(person_dir, exist_ok=True)
 
     count = 0
-    print(f"Look at the camera. Capturing {num_samples} samples for '{name}'. Press 'q' to stop early.")
+    last_capture_time = 0.0
+    prompts = ["look straight ahead", "turn slightly left", "turn slightly right",
+               "tilt your head up a bit", "tilt your head down a bit", "normal / relaxed"]
+    print(f"Look at the camera. Capturing {num_samples} samples for '{name}' -- "
+          f"move your head slowly through different angles as it captures. Press 'q' to stop early.")
 
     while count < num_samples:
         ret, frame = cap.read()
@@ -220,15 +228,26 @@ def enroll(name, num_samples=40):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         faces = face_cascade.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=5, minSize=(80, 80))
 
+        now = time.time()
+        can_capture = (now - last_capture_time) >= ENROLL_CAPTURE_INTERVAL
+
         for (x, y, w, h) in faces:
-            face_img = gray[y:y + h, x:x + w]
-            face_img = cv2.resize(face_img, (200, 200))
-            count += 1
-            cv2.imwrite(os.path.join(person_dir, f"{count}.jpg"), face_img)
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            cv2.putText(frame, f"{count}/{num_samples}", (x, y - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            color = (0, 255, 0) if can_capture else (0, 200, 200)
+            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+
+            if can_capture:
+                face_img = cv2.equalizeHist(gray[y:y + h, x:x + w])
+                face_img = cv2.resize(face_img, (200, 200))
+                count += 1
+                last_capture_time = now
+                cv2.imwrite(os.path.join(person_dir, f"{count}.jpg"), face_img)
+                cv2.putText(frame, f"{count}/{num_samples}", (x, y - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
             break  # one face per frame is enough
+
+        prompt = prompts[count % len(prompts)]
+        cv2.putText(frame, f"Now: {prompt}", (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
         cv2.imshow("Enroll - press q to quit", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -362,7 +381,8 @@ def run(owner_name=None):
                 detections = []  # (box, color, label) for every face/body found this check
 
                 for (x, y, w, h) in faces:
-                    face_img = cv2.resize(gray[y:y + h, x:x + w], (200, 200))
+                    face_img = cv2.equalizeHist(gray[y:y + h, x:x + w])
+                    face_img = cv2.resize(face_img, (200, 200))
                     label_id, confidence = recognizer.predict(face_img)
                     # LBPH: LOWER confidence value = better match
                     is_owner = (label_id == owner_id) and (confidence < CONFIDENCE_THRESHOLD)
