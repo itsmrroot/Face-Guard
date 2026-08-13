@@ -25,7 +25,6 @@ everywhere.
 - [Run it automatically at startup](#-run-it-automatically-at-startup)
 - [Troubleshooting](#-troubleshooting)
 - [Notes & limits](#-notes--limits)
-- [Credits](#-credits)
 
 ## ✨ Features
 
@@ -34,7 +33,6 @@ everywhere.
 - 🙈 **Hidden-face detection** — locks fast if a person is detected but their face isn't (covered, turned away, dodging the camera)
 - 🫥 **Covered-lens detection** — locks almost instantly if the camera itself is physically blocked (a hand or object over the lens from behind, etc.)
 - 🔒 **Automatic lock** — locks the screen the moment an unrecognized face, a hidden face, or a blocked lens is confirmed
-- 🔊 **Sound alert** — plays an alarm sound the moment a stranger triggers a lock
 - 🎥 **Live preview** — color-coded boxes and a real-time status line show exactly what the guard sees
 - 📸 **Intruder snapshots** — auto-saved and organized by date
 - 🖥️ **Cross-platform locking** — macOS, Linux, and Windows all supported
@@ -125,7 +123,7 @@ It will:
   almost instantly**
 - If it sees a face that doesn't match `--owner` (or doesn't match well
   enough) for `CONSEC_STRANGER_FRAMES` checks in a row, it **locks the
-  screen and plays an alert sound** (`assets/sounds/stranger_alert.mp3`)
+  screen**
 - If it detects a **person with no face at all** (front or side) for
   `PERSON_NO_FACE_LOCK_FRAMES` checks in a row, it **locks the screen too**
   — this is what catches someone deliberately hiding their face
@@ -274,9 +272,3 @@ it used (`Screen locked via 'open'` / `'osascript'` / `'pmset'`):
   background shapes. Watch the status line and tune `scaleFactor`/
   `minNeighbors`/`minSize` in `run()` for your setup.
 - The webcam light will turn on whenever the guard checks the camera.
-
-## 🙏 Credits
-
-- `assets/sounds/stranger_alert.mp3` — "World War 2 Air Raid Siren Alarm
-  Sound Effect" by SoundEffectsFactory, used under a Creative Commons Zero
-  (CC0) license.
