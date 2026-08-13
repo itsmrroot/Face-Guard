@@ -1,0 +1,23 @@
+# --- Personal / biometric data: never commit this ---
+# Enrolled face photos (whoever ran `enroll`)
+dataset/
+# Trained recognizer model + name labels derived from the photos above
+trainer/
+# Snapshots of anyone flagged as a stranger
+intruder_snapshots/
+# Runtime log -- records names, timestamps, lock events
+face_guard.log
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+.DS_Store
