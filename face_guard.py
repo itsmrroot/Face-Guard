@@ -101,25 +101,34 @@ def log(msg):
 # Sound alerts (cross platform, non-blocking)
 # ---------------------------------------------------------------------------
 def play_sound(path):
+    """Starts playback and returns a handle that stop_sound() can stop early (or None if unavailable)."""
     if not os.path.exists(path):
-        return
+        return None
     system = platform.system()
     try:
         if system == "Darwin":
-            subprocess.Popen(["afplay", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return subprocess.Popen(["afplay", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         elif system == "Linux":
             for cmd in (["mpg123", "-q", path],
                         ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path],
                         ["paplay", path]):
                 try:
-                    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    break
+                    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 except FileNotFoundError:
                     continue
         elif system == "Windows":
             os.startfile(path)  # noqa: uses the OS's default associated player, non-blocking
     except Exception as e:
         log(f"WARNING: could not play sound '{path}': {e}")
+    return None
+
+
+def stop_sound(process):
+    if process is not None and process.poll() is None:
+        try:
+            process.terminate()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +320,7 @@ def run(owner_name=None):
     person_no_face_streak = 0
     camera_covered_streak = 0
     last_lock_time = 0
+    sound_process = None
 
     try:
         while True:
@@ -337,7 +347,10 @@ def run(owner_name=None):
                 # LBPH: LOWER confidence value = better match
                 is_owner = (label_id == owner_id) and (confidence < CONFIDENCE_THRESHOLD)
 
-                if not is_owner:
+                if is_owner:
+                    stop_sound(sound_process)
+                    sound_process = None
+                else:
                     frame_is_stranger = True
                     now_dt = datetime.now()
                     day_dir = os.path.join(SNAPSHOT_DIR, now_dt.strftime("%Y-%m-%d"))
@@ -417,7 +430,8 @@ def run(owner_name=None):
                 if now - last_lock_time > LOCK_COOLDOWN_SECONDS:
                     if stranger_streak >= CONSEC_STRANGER_FRAMES:
                         reason = "Unrecognized face"
-                        play_sound(STRANGER_SOUND_PATH)
+                        stop_sound(sound_process)
+                        sound_process = play_sound(STRANGER_SOUND_PATH)
                     elif camera_covered_streak >= CAMERA_COVERED_LOCK_FRAMES:
                         reason = "Camera appears physically covered/blocked"
                     elif person_no_face_streak >= PERSON_NO_FACE_LOCK_FRAMES:
@@ -464,6 +478,7 @@ def run(owner_name=None):
     except KeyboardInterrupt:
         log("Guard stopped by user.")
     finally:
+        stop_sound(sound_process)
         cap.release()
         cv2.destroyAllWindows()
 
